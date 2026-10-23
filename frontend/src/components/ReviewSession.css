@@ -1,0 +1,258 @@
+/* ---------------------------------------------------------------------------
+   Review session — flip card, progress, rating bar.
+   Namespaced with .rs-* so it never fights the legacy .review-* rules.
+--------------------------------------------------------------------------- */
+
+.rs-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.rs-progress {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.rs-progress-track {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-chip);
+  overflow: hidden;
+}
+
+.rs-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-strong), var(--accent));
+  transition: width 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.rs-progress-text {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-mid);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rs-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.rs-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--bg-chip);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.rs-chip.accent {
+  background: var(--bg-accent);
+  color: var(--accent);
+}
+
+/* Flip card -------------------------------------------------------------- */
+.rs-flip {
+  perspective: 1400px;
+}
+
+.rs-flip-inner {
+  display: grid;
+  transform-style: preserve-3d;
+  transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.rs-flip-inner.flipped {
+  transform: rotateY(180deg);
+}
+
+.rs-face {
+  grid-area: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 16px;
+  min-height: 240px;
+  padding: 30px 28px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+button.rs-face:hover {
+  border-color: var(--accent-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.rs-face-back {
+  transform: rotateY(180deg);
+  border-color: var(--accent-strong);
+  background: var(--bg-accent-soft);
+  cursor: default;
+  box-shadow: var(--shadow-sm);
+}
+
+.rs-front-text {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--text-strong);
+}
+
+.rs-back-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text-body);
+  white-space: pre-wrap;
+}
+
+.rs-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.rs-hint kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  background: var(--bg-chip);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* Ratings ---------------------------------------------------------------- */
+.rs-ratings {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.rs-rating {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 12px 8px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+  font-family: inherit;
+  cursor: pointer;
+  transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.rs-rating:hover:not(:disabled) {
+  transform: translateY(-2px);
+}
+
+.rs-rating:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.rs-rating strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.rs-rating span {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.rs-rating kbd {
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--text-faintest);
+  font-family: inherit;
+}
+
+.rs-rating.again { border-color: var(--danger-chip); }
+.rs-rating.again strong { color: var(--danger-text); }
+.rs-rating.again:hover:not(:disabled) { background: var(--danger-bg); border-color: var(--danger-strong); }
+
+.rs-rating.hard { border-color: var(--warning-bg); }
+.rs-rating.hard strong { color: var(--warning-text); }
+.rs-rating.hard:hover:not(:disabled) { background: var(--warning-bg-hover); border-color: var(--warning-strong); }
+
+.rs-rating.good { border-color: var(--success-bg); }
+.rs-rating.good strong { color: var(--success); }
+.rs-rating.good:hover:not(:disabled) { background: var(--success-bg-hover); border-color: var(--success-strong); }
+
+.rs-rating.easy { border-color: var(--easy-chip); }
+.rs-rating.easy strong { color: var(--easy-text); }
+.rs-rating.easy:hover:not(:disabled) { background: var(--easy-bg-hover); border-color: var(--easy-strong); }
+
+/* Completion ------------------------------------------------------------- */
+.rs-done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 46px 24px;
+  text-align: center;
+}
+
+.rs-done-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.rs-done strong {
+  font-size: 17px;
+  color: var(--text-strong);
+}
+
+.rs-done p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+@media (max-width: 560px) {
+  .rs-ratings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rs-face { padding: 24px 20px; min-height: 200px; }
+  .rs-front-text { font-size: 17px; }
+}

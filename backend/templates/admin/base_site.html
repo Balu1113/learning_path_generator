@@ -1,0 +1,20 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block title %}{{ title }} | LearnPath Admin{% endblock %}
+
+{% block extrastyle %}
+{{ block.super }}
+<link rel="stylesheet" href="{% static 'learnpath/admin.css' %}">
+{% endblock %}
+
+{% block branding %}
+<h1 id="branding">
+  <a href="{% url 'admin:index' %}">
+    <span class="brand-mark">LP</span>
+    LearnPath <span class="brand-sub">Admin</span>
+  </a>
+</h1>
+{% endblock %}
+
+{% block nav-global %}{% endblock %}

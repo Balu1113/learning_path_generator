@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# Build/runtime artifacts
+*.log
+backend/db.sqlite3
+chroma_db/
+backend/chroma_db/
+backend/cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
