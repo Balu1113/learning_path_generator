@@ -14,6 +14,16 @@ import SharePage from "./pages/SharePage";
 import Gallery from "./pages/Gallery";
 import Groups from "./pages/Groups";
 import ResourceExplorer from "./pages/ResourceExplorer";
+import Portfolio from "./pages/Portfolio";
+import JobTarget from "./pages/JobTarget";
+import Gamification from "./pages/Gamification";
+import Analytics from "./pages/Analytics";
+import SkillGraphPage from "./pages/SkillGraphPage";
+import PeerReview from "./pages/PeerReview";
+import MarketplacePage from "./pages/MarketplacePage";
+import VideoLibrary from "./pages/VideoLibrary";
+import VoiceTutorPage from "./pages/VoiceTutorPage";
+import PracticeScenarioPage from "./pages/PracticeScenarioPage";
 
 export default function App() {
   return (
@@ -33,6 +43,17 @@ export default function App() {
             <Route path="/onboarding" element={<Onboarding />} />
             <Route path="/gallery" element={<Gallery />} />
             <Route path="/groups" element={<Groups />} />
+            <Route path="/portfolio" element={<Portfolio />} />
+            <Route path="/portfolio/:username" element={<Portfolio />} />
+            <Route path="/job-target" element={<JobTarget />} />
+            <Route path="/gamification" element={<Gamification />} />
+            <Route path="/analytics" element={<Analytics />} />
+            <Route path="/skills" element={<SkillGraphPage />} />
+            <Route path="/peer-review" element={<PeerReview />} />
+            <Route path="/marketplace" element={<MarketplacePage />} />
+            <Route path="/videos" element={<VideoLibrary />} />
+            <Route path="/voice-tutor" element={<VoiceTutorPage />} />
+            <Route path="/practice" element={<PracticeScenarioPage />} />
             <Route path="/p/:slug" element={<SharePage />} />
           </Route>
         </Routes>

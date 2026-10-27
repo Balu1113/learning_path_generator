@@ -1,7 +1,7 @@
 """Badge catalogue and evaluation."""
 import json
 
-from .models import Badge, PathProgress, StudyActivity, TestResult
+from .models import Badge, MilestoneProject, PathProgress, StudyActivity, TestResult
 from .progress_stats import streaks
 from memory.vector_store import vector_memory
 
@@ -14,6 +14,7 @@ BADGES = [
     {"key": "streak-30", "name": "30-Day Streak", "description": "Studied 30 days in a row.", "icon": "Flame"},
     {"key": "quiz-master", "name": "Quiz Master", "description": "Completed 5 phase tests.", "icon": "ClipboardCheck"},
     {"key": "review-100", "name": "Card Shark", "description": "Reviewed 100 flashcards.", "icon": "Layers"},
+    {"key": "project-shipped", "name": "Project Shipped", "description": "Had a capstone project reviewed by AI.", "icon": "Rocket"},
 ]
 
 
@@ -70,6 +71,7 @@ def evaluate(user):
         "streak-30": current_streak >= 30,
         "quiz-master": TestResult.objects.filter(user=user).count() >= 5,
         "review-100": review_count >= 100,
+        "project-shipped": MilestoneProject.objects.filter(user=user, status="reviewed").exists(),
     }
 
     existing = {b.key: b.earned_at for b in Badge.objects.filter(user=user)}

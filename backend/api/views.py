@@ -35,7 +35,8 @@ def _cache_set(key, data):
 
 from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_POST, require_GET, require_http_methods
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, csrf_protect
+from django.core.exceptions import ValidationError
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -58,10 +59,19 @@ from config import GEMINI_API_KEY, GEMINI_MODEL
 from .models import Feedback, PathProgress, ShareLink, TestResult
 from .progress_stats import record_activity
 from .badges import evaluate as evaluate_badges
+from .resource_catalog import (
+    annotate_verified_resources,
+    catalog_for_generation,
+    catalog_index,
+    format_catalog_for_prompt,
+)
 
 
-def _json_body(request):
+def _json_body(request, max_size=1048576):
+    """Parse JSON body with size limit (1MB default)."""
     try:
+        if len(request.body) > max_size:
+            raise ValueError("Request body too large")
         return json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
         return {}
@@ -109,32 +119,45 @@ CHAT_SYSTEM = """You are a friendly learning coach chatbot. The user is asking q
 --- LEARNING PATH END ---"""
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def agent_generate(request):
     data = _json_body(request)
-    goal = data.get("goal", "").strip()
+    goal = data.get("goal", "").strip()[:500]
     if not goal:
         return JsonResponse({"error": "Goal is required"}, status=400)
     try:
         result = run_agent(goal)
         return JsonResponse({"output": result["output"], "steps": result["steps"]})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Agent generation failed"}, status=500)
 
 
 def _parse_gen_params(data):
+    """Parse and validate generation parameters."""
     try:
         months = int(data.get("months", 6))
     except (TypeError, ValueError):
         months = 6
+    
+    goal = (data.get("goal") or "").strip()[:500]
+    current_level = (data.get("current_level") or "beginner").strip()[:50]
+    hours_per_day = data.get("hours_per_day", 2)
+    format_preference = (data.get("format_preference") or "").strip()[:200]
+    target_date = (data.get("target_date") or "").strip()[:50]
+    
+    try:
+        hours_per_day = max(1, min(24, int(hours_per_day)))
+    except (TypeError, ValueError):
+        hours_per_day = 2
+    
     return {
-        "goal": (data.get("goal") or "").strip(),
-        "current_level": data.get("current_level", "beginner"),
-        "hours_per_day": data.get("hours_per_day", 2),
-        "format_preference": data.get("format_preference", "courses and hands-on projects"),
-        "months": max(1, months),
-        "target_date": (data.get("target_date") or "").strip(),
+        "goal": goal,
+        "current_level": current_level,
+        "hours_per_day": hours_per_day,
+        "format_preference": format_preference or "courses and hands-on projects",
+        "months": max(1, min(60, months)),
+        "target_date": target_date,
     }
 
 
@@ -188,7 +211,7 @@ def _copy_progress(from_path_id, to_path_id, user):
     return copied
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def path_generate(request):
     data = _json_body(request)
@@ -201,10 +224,10 @@ def path_generate(request):
         record_activity(request.user, "path")
         return JsonResponse({"output": output, "id": doc_id})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Failed to generate path"}, status=500)
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def path_structured(request):
     data = _json_body(request)
@@ -212,16 +235,24 @@ def path_structured(request):
     if not params["goal"]:
         return JsonResponse({"error": "Goal is required"}, status=400)
     try:
-        structured = generate_learning_path_structured(**params)
+        catalog_rows = catalog_for_generation(params["goal"])
+        structured = generate_learning_path_structured(
+            **params, catalog=format_catalog_for_prompt(catalog_rows),
+        )
+        structured = annotate_verified_resources(structured, catalog_index(catalog_rows))
         doc = json.dumps(structured)
         doc_id = vector_memory.save_path(params["goal"], doc, meta=_base_meta(request, params, "structured"))
         record_activity(request.user, "path")
-        return JsonResponse({"output": structured, "id": doc_id})
+        return JsonResponse({
+            "output": structured,
+            "id": doc_id,
+            "catalog_used": len(catalog_rows),
+        })
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Failed to generate structured path"}, status=500)
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def path_stream(request):
     data = _json_body(request)
@@ -235,25 +266,25 @@ def path_stream(request):
                 yield f"data: {json.dumps({'chunk': text})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'error': 'Stream failed'})}\n\n"
 
     return StreamingHttpResponse(event_stream(), content_type="text/event-stream")
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def path_stream_save(request):
     data = _json_body(request)
     params = _parse_gen_params(data)
-    output = data.get("output", "").strip()
+    output = data.get("output", "").strip()[:50000]
     if not params["goal"] or not output:
-        return JsonResponse({"error": "goal and output are required"}, status=400)
+        return JsonResponse({"error": "Goal and output are required"}, status=400)
     try:
         doc_id = vector_memory.save_path(params["goal"], output, meta=_base_meta(request, params, "markdown"))
         record_activity(request.user, "path")
         return JsonResponse({"id": doc_id})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Failed to save path"}, status=500)
 
 
 @require_GET
@@ -330,19 +361,25 @@ def _structured_workspace(path) -> dict | None:
         for ti, t in enumerate(ph.get("topics") or []):
             if not isinstance(t, dict):
                 continue
+            resources = []
+            for r in (t.get("resources") or []):
+                if not isinstance(r, dict):
+                    continue
+                entry = {
+                    "name": r.get("name", ""),
+                    "type": r.get("type", ""),
+                    "note": r.get("note", ""),
+                }
+                for extra in ("url", "cost", "level", "rating", "source", "verified"):
+                    if extra in r:
+                        entry[extra] = r[extra]
+                resources.append(entry)
             topics.append({
                 "index": ti,
                 "key": f"t:{pi}:{ti}",
                 "title": t.get("title", ""),
                 "details": t.get("details", ""),
-                "resources": [
-                    {
-                        "name": r.get("name", ""),
-                        "type": r.get("type", ""),
-                        "note": r.get("note", ""),
-                    }
-                    for r in (t.get("resources") or []) if isinstance(r, dict)
-                ],
+                "resources": resources,
             })
         phases.append({
             "index": pi,
@@ -440,10 +477,11 @@ def paths_workspace(request, doc_id):
     })
 
 
-@csrf_exempt
+@csrf_protect
 @require_http_methods(["DELETE"])
 def paths_delete(request, doc_id):
     try:
+        doc_id = str(doc_id).strip()[:100]
         path = _path_or_none(doc_id)
         if path is None:
             return JsonResponse({"error": "Path not found"}, status=404)
@@ -453,36 +491,40 @@ def paths_delete(request, doc_id):
         ShareLink.objects.filter(path_id=doc_id).delete()
         return JsonResponse({"deleted": True, "id": doc_id})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Delete failed"}, status=500)
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def paths_chat(request, doc_id):
+    doc_id = str(doc_id).strip()[:100]
     path = _path_or_none(doc_id)
     if path is None:
         return JsonResponse({"error": "Path not found"}, status=404)
     if not _can_access(request, path["metadata"]):
         return JsonResponse({"error": "Not allowed"}, status=403)
     data = _json_body(request)
-    message = (data.get("message") or "").strip()
+    message = (data.get("message") or "").strip()[:2000]
     if not message:
         return JsonResponse({"error": "Message is required"}, status=400)
     history = data.get("history") or []
+    if not isinstance(history, list):
+        history = []
+    history = history[:20]
     try:
         content = path["content"]
         if path["metadata"].get("format") == "structured":
             content = json.dumps(json.loads(content), indent=1)
         messages = [("system", CHAT_SYSTEM.format(path_content=content[:8000]))]
-        for h in history[-10:]:
+        for h in history:
             role = "assistant" if h.get("role") == "assistant" else "human"
-            messages.append((role, str(h.get("content", ""))))
+            messages.append((role, str(h.get("content", ""))[:2000]))
         messages.append(("human", message))
         chain = ChatPromptTemplate.from_messages(messages) | _get_llm() | StrOutputParser()
         reply = chain.invoke({})
         return JsonResponse({"reply": reply})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Chat failed"}, status=500)
 
 
 @require_GET
@@ -495,18 +537,19 @@ def paths_progress(request, doc_id):
     return JsonResponse({"done": done})
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def paths_progress_save(request, doc_id):
     if not request.user.is_authenticated:
-        return JsonResponse({"error": "Login required to sync progress"}, status=401)
+        return JsonResponse({"error": "Login required"}, status=401)
+    doc_id = str(doc_id).strip()[:100]
     path = _path_or_none(doc_id)
     if path is None:
         return JsonResponse({"error": "Path not found"}, status=404)
     if not _can_access(request, path["metadata"]):
         return JsonResponse({"error": "Not allowed"}, status=403)
     data = _json_body(request)
-    item_key = (data.get("item_key") or "").strip()
+    item_key = (data.get("item_key") or "").strip()[:100]
     done = bool(data.get("done", True))
     if not item_key:
         return JsonResponse({"error": "item_key is required"}, status=400)
@@ -520,9 +563,10 @@ def paths_progress_save(request, doc_id):
     return JsonResponse({"ok": True, "done_count": total})
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def paths_feedback(request, doc_id):
+    doc_id = str(doc_id).strip()[:100]
     path = _path_or_none(doc_id)
     if path is None:
         return JsonResponse({"error": "Path not found"}, status=404)
@@ -530,9 +574,9 @@ def paths_feedback(request, doc_id):
     try:
         value = int(data.get("value"))
     except (TypeError, ValueError):
-        return JsonResponse({"error": "value must be 1 or -1"}, status=400)
+        return JsonResponse({"error": "Invalid feedback value"}, status=400)
     if value not in (1, -1):
-        return JsonResponse({"error": "value must be 1 or -1"}, status=400)
+        return JsonResponse({"error": "Invalid feedback value"}, status=400)
     try:
         Feedback.objects.update_or_create(
             path_id=doc_id, user=request.user if request.user.is_authenticated else None,
@@ -610,11 +654,72 @@ def paths_ics(request, doc_id):
     return resp
 
 
-@csrf_exempt
+# ---------------------------------------------------------------------------
+# Adaptive placement (one-question-at-a-time)
+# ---------------------------------------------------------------------------
+
+@csrf_protect
+@require_POST
+def placement_adaptive_start(request):
+    """Generate a question pool and return the first question."""
+    from .placement_adaptive import new_state, prepare_pool, safe_question
+    data = _json_body(request)
+    goal = (data.get("goal") or "").strip()[:500]
+    if not goal:
+        return JsonResponse({"error": "Goal is required"}, status=400)
+    try:
+        quiz = generate_placement_quiz(goal)
+    except Exception as e:
+        return JsonResponse({"error": "Failed to generate assessment"}, status=500)
+    pool = prepare_pool(quiz.get("questions") or [])
+    if not pool:
+        return JsonResponse({"error": "Assessment generation failed"}, status=502)
+    state = new_state(goal, pool)
+    session_id = uuid.uuid4().hex
+    request.session[f"adaptive_{session_id}"] = state
+    from .placement_adaptive import current_question
+    q = current_question(state)
+    return JsonResponse({"session_id": session_id, "question": safe_question(q), "done": False})
+
+
+@csrf_protect
+@require_POST
+def placement_adaptive_answer(request):
+    """Record one answer; return the next question or the final summary."""
+    from .placement_adaptive import current_question, record_answer, safe_question, session_summary
+    data = _json_body(request)
+    session_id = (data.get("session_id") or "").strip()[:64]
+    state = request.session.get(f"adaptive_{session_id}")
+    if not state:
+        return JsonResponse({"error": "Session not found"}, status=404)
+    question_id = str(data.get("question_id") or "").strip()[:100]
+    try:
+        answer_index = int(data.get("answer_index", -1))
+        if answer_index < 0 or answer_index > 10:
+            raise ValueError("Invalid answer index")
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Invalid answer"}, status=400)
+    try:
+        state = record_answer(state, question_id, answer_index)
+    except (KeyError, ValueError):
+        return JsonResponse({"error": "Invalid response"}, status=400)
+    request.session[f"adaptive_{session_id}"] = state
+    if state["done"]:
+        del request.session[f"adaptive_{session_id}"]
+        return JsonResponse({"done": True, "summary": session_summary(state)})
+    q = current_question(state)
+    return JsonResponse({"done": False, "question": safe_question(q)})
+
+
+# ---------------------------------------------------------------------------
+# Legacy batch placement
+# ---------------------------------------------------------------------------
+
+@csrf_protect
 @require_POST
 def placement_start(request):
     data = _json_body(request)
-    goal = (data.get("goal") or "").strip()
+    goal = (data.get("goal") or "").strip()[:500]
     if not goal:
         return JsonResponse({"error": "Goal is required"}, status=400)
     try:
@@ -636,17 +741,17 @@ def placement_start(request):
         request.session[f"placement_{quiz_id}"] = {"goal": goal, "questions": session_quiz}
         return JsonResponse({"quiz_id": quiz_id, "questions": safe_questions})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Assessment generation failed"}, status=500)
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def placement_submit(request):
     data = _json_body(request)
-    quiz_id = (data.get("quiz_id") or "").strip()
+    quiz_id = (data.get("quiz_id") or "").strip()[:64]
     stored = request.session.get(f"placement_{quiz_id}")
     if not stored:
-        return JsonResponse({"error": "Quiz not found or expired"}, status=404)
+        return JsonResponse({"error": "Assessment not found"}, status=404)
     answers = data.get("answers") or {}
     correct = 0
     total = len(stored["questions"])
@@ -667,9 +772,15 @@ def placement_submit(request):
     return JsonResponse({"score": correct, "total": total, "percent": pct, "suggested_level": level})
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def phase_test_start(request, doc_id, phase_idx):
+    doc_id = str(doc_id).strip()[:100]
+    try:
+        phase_idx = int(phase_idx)
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Invalid phase index"}, status=400)
+    
     path = _path_or_none(doc_id)
     if path is None:
         return JsonResponse({"error": "Path not found"}, status=404)
@@ -689,7 +800,7 @@ def phase_test_start(request, doc_id, phase_idx):
     else:
         md_phases = parse_markdown_phases(path["content"])
         if not md_phases:
-            return JsonResponse({"error": "No phases could be detected in this roadmap. Regenerate it as an interactive checklist to take phase tests."}, status=400)
+            return JsonResponse({"error": "No phases found"}, status=400)
         if phase_idx < 0 or phase_idx >= len(md_phases):
             return JsonResponse({"error": "Phase not found"}, status=404)
         phase = phase_from_markdown_body(md_phases[phase_idx])
@@ -702,10 +813,11 @@ def phase_test_start(request, doc_id, phase_idx):
     avoid = data.get("avoid") or []
     if not isinstance(avoid, list):
         avoid = []
+    avoid = [str(a).strip()[:100] for a in avoid[:20]]
 
     try:
         quiz = generate_phase_quiz(
-            goal=path["metadata"].get("goal", "learning"),
+            goal=path["metadata"].get("goal", "learning")[:500],
             phase=phase,
             count=count,
             avoid=avoid,
@@ -734,17 +846,17 @@ def phase_test_start(request, doc_id, phase_idx):
         }
         return JsonResponse({"quiz_id": quiz_id, "questions": safe_questions, "phase_title": phase.get("title", "")})
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return JsonResponse({"error": "Test generation failed"}, status=500)
 
 
-@csrf_exempt
+@csrf_protect
 @require_POST
 def phase_test_submit(request):
     data = _json_body(request)
-    quiz_id = (data.get("quiz_id") or "").strip()
+    quiz_id = (data.get("quiz_id") or "").strip()[:64]
     stored = request.session.get(f"test_{quiz_id}")
     if not stored:
-        return JsonResponse({"error": "Test not found or expired"}, status=404)
+        return JsonResponse({"error": "Test not found"}, status=404)
     answers = data.get("answers") or {}
     correct = 0
     results = []
@@ -796,6 +908,17 @@ def phase_test_submit(request):
             total=total,
             percent=pct,
         )
+        try:
+            from .skill_graph import record_skill_evidence
+            record_skill_evidence(
+                request.user,
+                stored.get("path_id", ""),
+                int(stored.get("phase_idx", 0) or 0),
+                pct,
+                strong=pct >= 70,
+            )
+        except Exception:
+            pass
     record_activity(request.user, "test")
 
     return JsonResponse({
@@ -895,10 +1018,20 @@ def resource_search(request):
     query = request.GET.get("query", "").strip()
     domain = request.GET.get("domain", "").strip()
     difficulty = request.GET.get("difficulty", "any").strip()
+
+    from .resource_catalog import search_catalog, search_result_item
+    hits = search_catalog(query=query, domain=domain, difficulty=difficulty, limit=12)
+    if hits:
+        return JsonResponse({
+            "results": [search_result_item(r) for r in hits],
+            "source": "catalog",
+            "count": len(hits),
+        })
+
     cache_key = "res_" + hashlib.md5(f"{query}|{domain}|{difficulty}".encode()).hexdigest()
     cached = _cache_get(cache_key, max_age_hours=72)
     if cached is not None:
-        return JsonResponse({"results": cached, "cached": True})
+        return JsonResponse({"results": cached, "cached": True, "source": "ai"})
     try:
         chain = RESOURCE_SEARCH_PROMPT | _get_llm() | StrOutputParser()
         raw = _strip_fences(chain.invoke({
@@ -910,10 +1043,11 @@ def resource_search(request):
         if not isinstance(items, list):
             raise ValueError("Expected a JSON array of resources")
         results = [
-            {"metadata": it} for it in items
+            {"metadata": {**it, "source": "ai", "verified": False}}
+            for it in items
             if isinstance(it, dict) and it.get("topic_name")
         ]
         _cache_set(cache_key, results)
-        return JsonResponse({"results": results})
+        return JsonResponse({"results": results, "source": "ai"})
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)

@@ -4,6 +4,7 @@ import {
   getBadges,
   getDueFlashcards,
   getPathHistory,
+  getPathRecommendation,
   getPathWorkspace,
   getStreak,
   reviewFlashcard,
@@ -17,18 +18,24 @@ import ReviewSession from "../components/ReviewSession";
 import PomodoroPanel from "../components/PomodoroPanel";
 import ChatPanel from "../components/ChatPanel";
 import PhaseTest from "../components/PhaseTest";
+import PhaseProject from "../components/PhaseProject";
+import SkillsMatrix from "../components/SkillsMatrix";
+import CodeChallengePanel from "../components/CodeChallengePanel";
 import StudyNotesModal from "../components/StudyNotesModal";
+import "../components/CodeChallenge.css";
 import {
   Award,
   BookOpen,
   CalendarDays,
   CheckCircle2,
+  Compass,
   ChevronRight,
   ClipboardCheck,
   Flame,
   Layers,
   Loader2,
   LogIn,
+  Network,
   PlayCircle,
   Sparkles,
   Target,
@@ -54,13 +61,6 @@ function firstIncompletePhase(phases, doneKeys) {
   return i >= 0 ? i : 0;
 }
 
-function greeting() {
-  const h = new Date().getHours();
-  if (h < 12) return "Good morning";
-  if (h < 18) return "Good afternoon";
-  return "Good evening";
-}
-
 export default function Study() {
   const { user, loading: authLoading } = useAuth();
 
@@ -75,6 +75,7 @@ export default function Study() {
   const [due, setDue] = useState(null);
   const [streak, setStreak] = useState(null);
   const [badges, setBadges] = useState(null);
+  const [recommendation, setRecommendation] = useState(null);
 
   const [modal, setModal] = useState(null);
   const [reviewing, setReviewing] = useState(false);
@@ -95,9 +96,10 @@ export default function Study() {
   }, []);
 
   useEffect(() => {
-    if (!pathId) {
+    if (!pathId || !user) {
       setWs(null);
       setDone([]);
+      setRecommendation(null);
       return undefined;
     }
     let alive = true;
@@ -121,10 +123,13 @@ export default function Study() {
       })
       .catch(() => alive && setError("Failed to load the study workspace for this roadmap."))
       .finally(() => alive && setWsLoading(false));
+    getPathRecommendation(pathId)
+      .then((d) => alive && !d.error && setRecommendation(d))
+      .catch(() => alive && setRecommendation(null));
     return () => {
       alive = false;
     };
-  }, [pathId]);
+  }, [pathId, user]);
 
   useEffect(() => {
     if (!user) {
@@ -179,9 +184,40 @@ export default function Study() {
       const was = prev.includes(key);
       const next = was ? prev.filter((k) => k !== key) : [...prev, key];
       localStorage.setItem(localProgressKey(pathId), JSON.stringify(next));
-      if (user) saveProgress(pathId, key, !was).catch(() => {});
+      if (user) {
+        saveProgress(pathId, key, !was)
+          .then((d) => {
+            if (!d.error) return getPathRecommendation(pathId);
+            return null;
+          })
+          .then((d) => d && !d.error && setRecommendation(d))
+          .catch(() => {});
+      }
       return next;
     });
+  };
+
+  const followRecommendation = () => {
+    if (!recommendation) return;
+    selectPhase(recommendation.phase_idx);
+    if (recommendation.state === "validate") {
+      setModal({ test: recommendation.phase_idx });
+      return;
+    }
+    if (recommendation.state === "build") {
+      setTimeout(() => {
+        document.getElementById("phase-project")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
+      return;
+    }
+    setTimeout(() => {
+      const el = document.querySelector('.ws-topics') || document.querySelector('.ws-grid') || document.querySelector('.ws-main');
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      } else {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    }, 160);
   };
 
   const handleRate = async (card, rating) => {
@@ -311,6 +347,9 @@ export default function Study() {
           <button className="ws-chip-btn" onClick={() => setModal("schedule")} title="Weekly study schedule">
             <CalendarDays size={14} /> Plan
           </button>
+          <button className="ws-chip-btn" onClick={() => setModal("skills")} title="Skill mastery matrix">
+            <Network size={14} /> Skills
+          </button>
           <button className="ws-chip-btn" onClick={() => setModal("badges")} title="Achievements">
             <Award size={14} /> {earnedBadges}
           </button>
@@ -318,6 +357,25 @@ export default function Study() {
       </header>
 
       {error && <div className="error-box">{error}</div>}
+
+      {recommendation && !wsLoading && paths.length > 0 && (
+        <section className={`ws-recommendation state-${recommendation.state}`}>
+          <span className="ws-recommendation-icon"><Compass size={18} /></span>
+          <div className="ws-recommendation-copy">
+            <span className="ws-recommendation-label">Recommended next step</span>
+            <strong>{recommendation.topic_title}</strong>
+            <p>{recommendation.reason}</p>
+          </div>
+          <button className="btn-primary ws-recommendation-action" onClick={followRecommendation}>
+            {recommendation.state === "validate"
+              ? "Take phase check"
+              : recommendation.state === "build"
+                ? "Open project"
+                : "Open step"}
+            <ChevronRight size={15} />
+          </button>
+        </section>
+      )}
 
       {wsLoading ? (
         <div className="empty-state">
@@ -426,7 +484,14 @@ export default function Study() {
                               {t.resources.map((r, ri) => (
                                 <li key={ri}>
                                   <span className="resource-type">{r.type || "resource"}</span>
-                                  <strong>{r.name}</strong>
+                                  {r.url ? (
+                                    <strong>
+                                      <a href={r.url} target="_blank" rel="noreferrer">{r.name}</a>
+                                    </strong>
+                                  ) : (
+                                    <strong>{r.name}</strong>
+                                  )}
+                                  {r.verified && <span className="ws-verified-chip">verified</span>}
                                   {r.note && <span className="resource-note"> — {r.note}</span>}
                                 </li>
                               ))}
@@ -455,6 +520,21 @@ export default function Study() {
                   </div>
                 </div>
               </section>
+            )}
+
+            {current && user && (
+              <>
+                <PhaseProject
+                  pathId={pathId}
+                  phaseIdx={phaseIdx}
+                  phaseTitle={current.title}
+                />
+                <CodeChallengePanel
+                  pathId={pathId}
+                  phaseIdx={phaseIdx}
+                  phaseTitle={current.title}
+                />
+              </>
             )}
           </main>
 
@@ -524,6 +604,20 @@ export default function Study() {
               hoursPerDay={ws?.hours_per_day}
               onClose={() => setModal(null)}
             />
+          </div>
+        </div>
+      )}
+
+      {modal === "skills" && (
+        <div className="modal-overlay" onClick={() => setModal(null)}>
+          <div className="modal-box ws-modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Skill mastery matrix</h3>
+              <button className="modal-close" onClick={() => setModal(null)}><X size={18} /></button>
+            </div>
+            <div className="modal-body">
+              <SkillsMatrix pathId={pathId} />
+            </div>
           </div>
         </div>
       )}

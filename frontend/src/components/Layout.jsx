@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { Brain, Zap, Layers, History, BarChart3, HelpCircle, GraduationCap, LogIn, LogOut, BookOpen, Sun, Moon, ShieldCheck, Library, Users, FolderSearch } from "lucide-react";
+import { Brain, Zap, Layers, History, BarChart3, HelpCircle, GraduationCap, LogIn, LogOut, BookOpen, Sun, Moon, ShieldCheck, Library, Users, FolderSearch, Award, Gamepad2, TrendingUp, GitBranch, Code, ShoppingCart, Video, Mic } from "lucide-react";
 import { useAuth } from "../auth";
 import { logoutUser } from "../api/client";
 import { useTheme } from "../theme";
@@ -13,6 +13,15 @@ const NAV_ITEMS = [
   { to: "/gallery", icon: Library, label: "Gallery" },
   { to: "/study", icon: BookOpen, label: "Study" },
   { to: "/groups", icon: Users, label: "Groups" },
+  { to: "/portfolio", icon: Award, label: "Portfolio" },
+  { to: "/gamification", icon: Gamepad2, label: "Gamification" },
+  { to: "/analytics", icon: TrendingUp, label: "Analytics" },
+  { to: "/skills", icon: GitBranch, label: "Skill Graph" },
+  { to: "/peer-review", icon: Code, label: "Peer Review" },
+  { to: "/marketplace", icon: ShoppingCart, label: "Marketplace" },
+  { to: "/videos", icon: Video, label: "Videos" },
+  { to: "/voice-tutor", icon: Mic, label: "Voice Tutor" },
+  { to: "/practice", icon: Zap, label: "Practice" },
   { to: "/history", icon: History, label: "Path History" },
   { to: "/dashboard", icon: BarChart3, label: "Dashboard" },
   { to: "/help", icon: HelpCircle, label: "Help" },

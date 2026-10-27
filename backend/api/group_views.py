@@ -8,7 +8,7 @@ from django.views.decorators.http import require_GET, require_POST
 
 from memory.vector_store import vector_memory
 from .adaptive_views import _topic_total
-from .models import GroupMembership, PathProgress, StudyActivity, StudyGroup
+from .models import GroupMembership, GroupDeadline, GroupCheckin, PathProgress, StudyActivity, StudyGroup
 from .study_views import _load_path, _require_user
 from .views import _json_body
 
@@ -199,3 +199,101 @@ def group_leave(request, group_id):
             group.delete()
             return JsonResponse({"left": True, "group_deleted": True})
     return JsonResponse({"left": True, "group_deleted": False})
+
+
+# -------------------------------------------------------------------------
+# Cohort features: shared deadlines and accountability check-ins
+# -------------------------------------------------------------------------
+
+@csrf_exempt
+@require_POST
+def group_set_deadline(request, group_id):
+    """Owner or member: create a shared deadline for the group."""
+    denied = _require_user(request)
+    if denied:
+        return denied
+    group = StudyGroup.objects.filter(id=group_id).first()
+    if group is None:
+        return JsonResponse({"error": "Group not found"}, status=404)
+    if not GroupMembership.objects.filter(group=group, user=request.user).exists():
+        return JsonResponse({"error": "Not a member of this group"}, status=403)
+    data = _json_body(request)
+    title = (data.get("title") or "").strip()[:200]
+    due_raw = (data.get("due_date") or "").strip()
+    description = (data.get("description") or "").strip()
+    if not title or not due_raw:
+        return JsonResponse({"error": "title and due_date are required"}, status=400)
+    try:
+        due_date = date.fromisoformat(due_raw[:10])
+    except ValueError:
+        return JsonResponse({"error": "due_date must be YYYY-MM-DD"}, status=400)
+    deadline = GroupDeadline.objects.create(
+        group=group,
+        title=title,
+        due_date=due_date,
+        description=description,
+        created_by=request.user,
+    )
+    return JsonResponse({
+        "id": deadline.id,
+        "title": deadline.title,
+        "due_date": deadline.due_date.isoformat(),
+        "description": deadline.description,
+        "created_at": deadline.created_at.isoformat(),
+    })
+
+
+@csrf_exempt
+@require_POST
+def group_checkin(request, group_id):
+    """Member: post a brief accountability check-in."""
+    denied = _require_user(request)
+    if denied:
+        return denied
+    group = StudyGroup.objects.filter(id=group_id).first()
+    if group is None:
+        return JsonResponse({"error": "Group not found"}, status=404)
+    if not GroupMembership.objects.filter(group=group, user=request.user).exists():
+        return JsonResponse({"error": "Not a member of this group"}, status=403)
+    data = _json_body(request)
+    message = (data.get("message") or "").strip()[:2000]
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+    checkin = GroupCheckin.objects.create(
+        group=group,
+        user=request.user,
+        message=message,
+    )
+    return JsonResponse({
+        "id": checkin.id,
+        "message": checkin.message,
+        "username": request.user.username,
+        "created_at": checkin.created_at.isoformat(),
+    })
+
+
+@require_GET
+def group_checkins(request, group_id):
+    """List recent check-ins for a group (newest first)."""
+    denied = _require_user(request)
+    if denied:
+        return denied
+    group = StudyGroup.objects.filter(id=group_id).first()
+    if group is None:
+        return JsonResponse({"error": "Group not found"}, status=404)
+    if not GroupMembership.objects.filter(group=group, user=request.user).exists():
+        return JsonResponse({"error": "Not a member of this group"}, status=403)
+    try:
+        limit = max(1, min(50, int(request.GET.get("limit", 20))))
+    except (TypeError, ValueError):
+        limit = 20
+    checkins = [
+        {
+            "id": c.id,
+            "username": c.user.username,
+            "message": c.message,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in GroupCheckin.objects.filter(group=group).select_related("user")[:limit]
+    ]
+    return JsonResponse({"checkins": checkins, "count": len(checkins)})

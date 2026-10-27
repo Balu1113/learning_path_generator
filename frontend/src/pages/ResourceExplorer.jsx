@@ -84,9 +84,25 @@ export default function ResourceExplorer() {
               <div className="card-top">
                 <span className="difficulty-badge" data-level={m.difficulty}>{m.difficulty}</span>
                 <span className="hours-badge">{m.estimated_hours}h</span>
+                {m.verified && <span className="quality-badge verified">verified</span>}
+                {m.stale && !m.broken && <span className="quality-badge stale">stale</span>}
+                {m.broken && <span className="quality-badge broken">link down</span>}
+                {m.cost && m.cost !== "free" && <span className="quality-badge cost">{m.cost}</span>}
+                {m.rating != null && (
+                  <span className="quality-badge rating">★ {Number(m.rating).toFixed(1)}</span>
+                )}
               </div>
-              <h3>{m.topic_name}</h3>
-              <p className="card-domain">{formatDomain(m.domain)} &rsaquo; {formatDomain(m.category)}</p>
+              {m.url ? (
+                <h3><a href={m.url} target="_blank" rel="noreferrer">{m.topic_name}</a></h3>
+              ) : (
+                <h3>{m.topic_name}</h3>
+              )}
+              <p className="card-domain">{formatDomain(m.domain)} &rsaquo; {formatDomain(m.category || "")}</p>
+              {m.description && <p className="card-desc">{m.description}</p>}
+              <p className="card-source">
+                {m.source === "catalog" ? "catalog" : "ai suggestion"}
+                {m.content_source === "curated" ? " · curated" : ""}
+              </p>
             </div>
           );
         })}

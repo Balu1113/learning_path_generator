@@ -876,6 +876,33 @@ class AdaptiveApiTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["alerts"], [])
 
+    def test_recommendation_uses_progress_then_requires_phase_evidence(self):
+        """The next-step API is ordered, explainable, and never infers mastery from a checkbox."""
+        from unittest.mock import patch
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self.client.get("/api/paths/path_test/recommendation")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["state"], "learn")
+            self.assertEqual(resp.json()["topic_title"], "Variables")
+
+            for item_key in ("t:0:0", "t:0:1", "t:0:2"):
+                PathProgress.objects.create(
+                    user=self.user, path_id="path_test", item_key=item_key, done=True,
+                )
+            resp = self.client.get("/api/paths/path_test/recommendation")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["state"], "validate")
+
+            TestResult.objects.create(
+                user=self.user, path_id="path_test", phase_idx=0, percent=40,
+            )
+            resp = self.client.get("/api/paths/path_test/recommendation")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["state"], "remediate")
+            self.assertEqual(resp.json()["score"], 40)
+
     def test_remediation_quiz_generated_from_missed_questions(self):
         from unittest.mock import patch
 
@@ -1336,3 +1363,1118 @@ class StudyGroupTests(TestCase):
         self._login(self.outsider)
         resp = self._req(f"/api/groups/{g['id']}/leave")
         self.assertEqual(resp.status_code, 403)
+
+
+class ProjectApiTests(TestCase):
+    """Project-based milestones: generation, submission, AI review, and the build state."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="builder", password="x")
+        self.other = User.objects.create_user(username="stranger", password="x")
+        self.path = structured_path(owner=str(self.user.id))
+
+    def _login(self, user=None):
+        self.client.force_login(user or self.user)
+
+    def _req(self, url, payload=None, method="POST"):
+        data = json.dumps(payload or {})
+        if method == "GET":
+            return self.client.get(url)
+        return self.client.post(url, data=data, content_type="application/json")
+
+    @staticmethod
+    def _spec(title="Todo CLI"):
+        return {
+            "title": title,
+            "brief": "Build a small CLI that manages a todo list.",
+            "acceptance_criteria": ["Add a task", "List tasks", "Mark done"],
+            "starter_template": "todo/\n  main.py\n  README.md",
+            "rubric": [
+                {"criterion": "Functionality", "max_points": 60, "description": "works end to end"},
+                {"criterion": "Code quality", "max_points": 40, "description": "clean and tested"},
+            ],
+        }
+
+    def test_generate_creates_project_for_phase(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.project_views.generate_phase_project", return_value=self._spec()):
+            resp = self._req("/api/paths/path_test/projects/generate", {"phase_idx": 0})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["created"], 1)
+        self.assertEqual(body["projects"][0]["title"], "Todo CLI")
+        self.assertEqual(body["projects"][0]["status"], "draft")
+        row = MilestoneProject.objects.get(user=self.user, path_id="path_test", phase_idx=0)
+        self.assertEqual(row.phase_title, "Basics")
+        self.assertEqual(len(row.acceptance_criteria), 3)
+
+    def test_generate_all_skips_existing_and_respects_force(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        self._login()
+        MilestoneProject.objects.create(
+            user=self.user, path_id="path_test", phase_idx=0,
+            phase_title="Basics", title="Old", brief="old brief",
+        )
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.project_views.generate_phase_project", return_value=self._spec("New")):
+            resp = self._req("/api/paths/path_test/projects/generate", {})
+        body = resp.json()
+        self.assertEqual(body["existing"], 1)
+        self.assertEqual(body["created"], 1)
+        self.assertEqual(body["projects"][0]["title"], "Old")
+
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.project_views.generate_phase_project", return_value=self._spec("New")):
+            resp = self._req("/api/paths/path_test/projects/generate", {"phase_idx": 0, "force": True})
+        body = resp.json()
+        self.assertEqual(body["updated"], 1)
+        row = MilestoneProject.objects.get(user=self.user, path_id="path_test", phase_idx=0)
+        self.assertEqual(row.title, "New")
+        self.assertEqual(row.status, "draft")
+
+    def test_generate_rejects_invalid_llm_output(self):
+        from unittest.mock import patch
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.project_views.generate_phase_project", return_value={"nope": 1}):
+            resp = self._req("/api/paths/path_test/projects/generate", {"phase_idx": 0})
+        self.assertEqual(resp.status_code, 502)
+
+    def test_generate_requires_login_and_valid_phase(self):
+        from unittest.mock import patch
+
+        resp = self._req("/api/paths/path_test/projects/generate", {"phase_idx": 0})
+        self.assertEqual(resp.status_code, 401)
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            self.assertEqual(
+                self._req("/api/paths/path_test/projects/generate", {"phase_idx": 9}).status_code, 404,
+            )
+
+    def test_list_and_detail(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        MilestoneProject.objects.create(
+            user=self.user, path_id="path_test", phase_idx=1,
+            phase_title="Advanced", title="Decorators lib", brief="Build a decorator library.",
+            status="in_progress",
+        )
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            body = self._req("/api/paths/path_test/projects", method="GET").json()
+            self.assertEqual(body["total"], 1)
+            self.assertEqual(body["projects"][0]["phase_idx"], 1)
+
+            detail = self._req("/api/paths/path_test/projects/1", method="GET").json()
+            self.assertEqual(detail["project"]["title"], "Decorators lib")
+
+            missing = self._req("/api/paths/path_test/projects/0", method="GET")
+            self.assertEqual(missing.status_code, 404)
+
+    def test_other_users_project_is_not_visible(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        MilestoneProject.objects.create(
+            user=self.other, path_id="path_test", phase_idx=0,
+            phase_title="Basics", title="Secret", brief="not yours",
+        )
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            body = self._req("/api/paths/path_test/projects", method="GET").json()
+            self.assertEqual(body["total"], 0)
+            resp = self._req("/api/paths/path_test/projects/0", method="GET")
+            self.assertEqual(resp.status_code, 404)
+            submit = self._req("/api/paths/path_test/projects/0/submit", {"submission_notes": "x"})
+            self.assertEqual(submit.status_code, 404)
+
+    def test_submit_validates_and_sets_status(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject, StudyActivity
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self._req("/api/paths/path_test/projects/0/submit", {})
+            self.assertEqual(resp.status_code, 404)
+
+            MilestoneProject.objects.create(
+                user=self.user, path_id="path_test", phase_idx=0,
+                phase_title="Basics", title="Todo CLI", brief="brief",
+            )
+            resp = self._req("/api/paths/path_test/projects/0/submit", {})
+            self.assertEqual(resp.status_code, 400)
+
+            resp = self._req("/api/paths/path_test/projects/0/submit", {"submission_url": "ftp://bad"})
+            self.assertEqual(resp.status_code, 400)
+
+            resp = self._req("/api/paths/path_test/projects/0/submit", {
+                "submission_url": "https://github.com/me/todo",
+                "submission_notes": "Added, list, done commands.",
+            })
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["project"]["status"], "submitted")
+            row = MilestoneProject.objects.get(user=self.user, path_id="path_test", phase_idx=0)
+            self.assertEqual(row.submission_url, "https://github.com/me/todo")
+            self.assertTrue(StudyActivity.objects.filter(user=self.user, kind="project").exists())
+
+    def test_review_scores_clamps_and_earns_badge(self):
+        from unittest.mock import patch
+        from .models import Badge, MilestoneProject
+
+        self._login()
+        row = MilestoneProject.objects.create(
+            user=self.user, path_id="path_test", phase_idx=0,
+            phase_title="Basics", title="Todo CLI", brief="brief",
+            status="submitted", submission_notes="I built it.",
+        )
+        result = {
+            "score": 150,
+            "review": "Solid work. Next: add tests.",
+            "criteria_met": ["Add a task"],
+            "criteria_missed": [{"criterion": "List tasks", "why": "no evidence"}],
+        }
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.project_views.review_phase_project", return_value=result):
+            resp = self._req("/api/paths/path_test/projects/0/review")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["score"], 100)
+        self.assertEqual(body["project"]["status"], "reviewed")
+        row.refresh_from_db()
+        self.assertEqual(row.ai_score, 100)
+        self.assertTrue(row.reviewed_at)
+        self.assertTrue(Badge.objects.filter(user=self.user, key="project-shipped").exists())
+        self.assertEqual(body["criteria_missed"][0]["criterion"], "List tasks")
+
+    def test_review_requires_submitted_status(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        self._login()
+        MilestoneProject.objects.create(
+            user=self.user, path_id="path_test", phase_idx=0,
+            phase_title="Basics", title="Todo CLI", brief="brief", status="draft",
+        )
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self._req("/api/paths/path_test/projects/0/review")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_resubmission_clears_previous_review(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        self._login()
+        MilestoneProject.objects.create(
+            user=self.user, path_id="path_test", phase_idx=0,
+            phase_title="Basics", title="Todo CLI", brief="brief",
+            status="reviewed", ai_review="old", ai_score=40,
+        )
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self._req("/api/paths/path_test/projects/0/submit", {"submission_notes": "v2"})
+        self.assertEqual(resp.status_code, 200)
+        row = MilestoneProject.objects.get(pk=resp.json()["project"]["id"])
+        self.assertEqual(row.status, "submitted")
+        self.assertEqual(row.ai_review, "")
+        self.assertIsNone(row.ai_score)
+
+    def test_recommendation_returns_build_state_for_unreviewed_project(self):
+        from unittest.mock import patch
+        from .models import MilestoneProject
+
+        self._login()
+        for key in ("t:0:0", "t:0:1", "t:0:2"):
+            PathProgress.objects.create(user=self.user, path_id="path_test", item_key=key, done=True)
+        TestResult.objects.create(
+            user=self.user, path_id="path_test", phase_idx=0, percent=85, score=5, total=5,
+        )
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self._req("/api/paths/path_test/recommendation", method="GET")
+            body = resp.json()
+            self.assertEqual(body["state"], "learn")
+            self.assertEqual(body["phase_idx"], 1)
+
+            MilestoneProject.objects.create(
+                user=self.user, path_id="path_test", phase_idx=0,
+                phase_title="Basics", title="Todo CLI", brief="brief", status="draft",
+            )
+            resp = self._req("/api/paths/path_test/recommendation", method="GET")
+            body = resp.json()
+            self.assertEqual(body["state"], "build")
+            self.assertEqual(body["topic_title"], "Todo CLI")
+            self.assertEqual(body["project_status"], "draft")
+
+            MilestoneProject.objects.filter(
+                user=self.user, path_id="path_test", phase_idx=0,
+            ).update(status="reviewed")
+            resp = self._req("/api/paths/path_test/recommendation", method="GET")
+            body = resp.json()
+            self.assertEqual(body["state"], "learn")
+            self.assertEqual(body["phase_idx"], 1)
+
+
+class SkillGraphTests(TestCase):
+    """Skill graph extraction, prerequisite edges, and mastery states."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="skillful", password="x")
+        self.path = structured_path(owner=str(self.user.id))
+
+    def _login(self):
+        self.client.force_login(self.user)
+
+    def _graph(self):
+        return {
+            "skills": [
+                {"name": "Python", "slug": "python", "description": "Core Python",
+                 "domain": "programming", "prerequisites": []},
+                {"name": "Unit Testing", "slug": "unit-testing", "description": "Testing in Python",
+                 "domain": "programming", "prerequisites": ["python"]},
+            ],
+            "topic_map": [
+                {"topic_key": "t:0:0", "skill_slugs": ["python"]},
+                {"topic_key": "t:0:1", "skill_slugs": ["python", "unit-testing"]},
+                {"topic_key": "t:0:2", "skill_slugs": ["python"]},
+            ],
+        }
+
+    def test_apply_skill_graph_creates_skills_edges_and_mappings(self):
+        from .models import PathSkill, Skill, SkillEdge
+        from .skill_graph import apply_skill_graph
+
+        result = apply_skill_graph(self.user, "path_test", self._graph())
+        self.assertEqual(result["topics_mapped"], 3)
+        self.assertEqual(Skill.objects.count(), 2)
+        edge = SkillEdge.objects.get()
+        self.assertEqual(edge.from_skill.slug, "python")
+        self.assertEqual(edge.to_skill.slug, "unit-testing")
+        self.assertEqual(PathSkill.objects.filter(user=self.user, path_id="path_test").count(), 4)
+
+        # Re-applying replaces mappings without duplicating skills or edges.
+        apply_skill_graph(self.user, "path_test", self._graph())
+        self.assertEqual(Skill.objects.count(), 2)
+        self.assertEqual(SkillEdge.objects.count(), 1)
+        self.assertEqual(PathSkill.objects.filter(user=self.user, path_id="path_test").count(), 4)
+
+    def test_apply_skill_graph_ignores_unknown_slugs(self):
+        from .models import PathSkill, Skill
+        from .skill_graph import apply_skill_graph
+
+        graph = {
+            "skills": [{"name": "Python", "slug": "python", "prerequisites": ["ghost"]}],
+            "topic_map": [
+                {"topic_key": "t:0:0", "skill_slugs": ["python", "ghost"]},
+                {"topic_key": "bogus", "skill_slugs": ["python"]},
+            ],
+        }
+        result = apply_skill_graph(self.user, "path_test", graph)
+        self.assertEqual(Skill.objects.count(), 1)
+        slugs = set(PathSkill.objects.filter(user=self.user).values_list("skill__slug", flat=True))
+        self.assertEqual(slugs, {"python"})
+        keys = set(PathSkill.objects.filter(user=self.user).values_list("topic_key", flat=True))
+        self.assertEqual(keys, {"t:0:0", "bogus"})
+
+    def test_record_skill_evidence_states_and_best_score(self):
+        from .models import Skill, SkillMastery
+        from .skill_graph import apply_skill_graph, record_skill_evidence
+
+        apply_skill_graph(self.user, "path_test", self._graph())
+
+        record_skill_evidence(self.user, "path_test", 0, 50, strong=False)
+        m = SkillMastery.objects.get(user=self.user, skill__slug="python")
+        self.assertEqual(m.state, SkillMastery.STATE_DEVELOPING)
+        self.assertEqual(m.score, 50)
+
+        record_skill_evidence(self.user, "path_test", 0, 85, strong=True)
+        m.refresh_from_db()
+        self.assertEqual(m.state, SkillMastery.STATE_VALIDATED)
+        self.assertEqual(m.score, 85)
+        self.assertEqual(m.evidence_count, 2)
+
+        # Best score wins; weak evidence never downgrades validated mastery.
+        record_skill_evidence(self.user, "path_test", 0, 40, strong=False)
+        m.refresh_from_db()
+        self.assertEqual(m.state, SkillMastery.STATE_VALIDATED)
+        self.assertEqual(m.score, 85)
+        self.assertEqual(m.evidence_count, 3)
+
+    def test_record_evidence_only_touches_phase_skills(self):
+        from .models import Skill, SkillMastery
+        from .skill_graph import apply_skill_graph, record_skill_evidence
+
+        graph = self._graph()
+        graph["topic_map"].append({"topic_key": "t:1:0", "skill_slugs": ["unit-testing"]})
+        apply_skill_graph(self.user, "path_test", graph)
+
+        record_skill_evidence(self.user, "path_test", 1, 90, strong=True)
+        self.assertTrue(
+            SkillMastery.objects.filter(user=self.user, skill__slug="unit-testing", state="validated").exists()
+        )
+        self.assertFalse(
+            SkillMastery.objects.filter(user=self.user, skill__slug="python").exists()
+        )
+
+    def test_extract_endpoint_returns_matrix(self):
+        from unittest.mock import patch
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.skill_views.generate_skill_graph", return_value=self._graph()):
+            resp = self.client.post(
+                "/api/paths/path_test/skills/extract",
+                data=json.dumps({}), content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["extracted"], 2)
+        self.assertEqual(body["edges"], 1)
+        self.assertEqual(body["topics_mapped"], 3)
+        self.assertEqual(body["matrix"]["counts"]["unassessed"], 2)
+        slugs = {s["slug"] for s in body["matrix"]["skills"]}
+        self.assertEqual(slugs, {"python", "unit-testing"})
+
+    def test_extract_rejects_invalid_graph_and_requires_login(self):
+        from unittest.mock import patch
+
+        resp = self.client.post(
+            "/api/paths/path_test/skills/extract",
+            data=json.dumps({}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 401)
+
+        self._login()
+        with patch("api.study_views._path_or_none", return_value=self.path), \
+                patch("api.skill_views.generate_skill_graph", return_value={"skills": []}):
+            resp = self.client.post(
+                "/api/paths/path_test/skills/extract",
+                data=json.dumps({}), content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 502)
+
+    def test_matrix_endpoint_reports_states_and_edges(self):
+        from unittest.mock import patch
+        from .skill_graph import apply_skill_graph, record_skill_evidence
+
+        self._login()
+        graph = {
+            "skills": [
+                {"name": "Python", "slug": "python", "prerequisites": []},
+                {"name": "Unit Testing", "slug": "unit-testing", "prerequisites": ["python"]},
+            ],
+            "topic_map": [
+                {"topic_key": "t:0:0", "skill_slugs": ["python"]},
+                {"topic_key": "t:1:0", "skill_slugs": ["unit-testing"]},
+            ],
+        }
+        apply_skill_graph(self.user, "path_test", graph)
+        record_skill_evidence(self.user, "path_test", 0, 88, strong=True)
+
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self.client.get("/api/paths/path_test/skills/matrix")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        by_slug = {s["slug"]: s for s in body["skills"]}
+        self.assertEqual(by_slug["python"]["state"], "validated")
+        self.assertEqual(by_slug["python"]["score"], 88)
+        self.assertEqual(by_slug["unit-testing"]["state"], "unassessed")
+        self.assertEqual(body["counts"], {"unassessed": 1, "developing": 0, "validated": 1})
+        self.assertEqual(body["edges"], [{"from": "python", "to": "unit-testing"}])
+        self.assertIn("t:0:0", body["topic_map"])
+
+    def test_recommendation_skips_topics_with_validated_skills(self):
+        from unittest.mock import patch
+        from .skill_graph import apply_skill_graph, record_skill_evidence
+
+        self._login()
+        graph = {
+            "skills": [{"name": "Python", "slug": "python", "prerequisites": []}],
+            "topic_map": [
+                {"topic_key": "t:0:0", "skill_slugs": ["python"]},
+                {"topic_key": "t:0:1", "skill_slugs": ["python"]},
+            ],
+        }
+        apply_skill_graph(self.user, "path_test", graph)
+        record_skill_evidence(self.user, "path_test", 0, 95, strong=True)
+
+        with patch("api.study_views._path_or_none", return_value=self.path):
+            resp = self.client.get("/api/paths/path_test/recommendation")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["state"], "learn")
+        self.assertEqual(body["topic_key"], "t:0:2")
+        self.assertIn("validated", body["reason"])
+
+
+class ResourceCatalogTests(TestCase):
+    """Curated resource catalog: upserts, health checks, search, generation hooks."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="resuser", password="x")
+        self.admin = User.objects.create_user(username="resadmin", password="x", is_superuser=True, is_staff=True)
+
+    def _upsert(self, url="https://example.com/course", name="Example Course", **kw):
+        from .resource_catalog import upsert_resource
+        defaults = dict(type="course", level="beginner", cost="free", domain="web_development",
+                        description="A test course", check_health=False)
+        defaults.update(kw)
+        return upsert_resource(url=url, name=name, **defaults)
+
+    def test_upsert_dedupes_by_url(self):
+        from .resource_catalog import upsert_resource
+        from .models import Resource
+
+        self._upsert(name="First")
+        self._upsert(name="Second", duration_hours=12)
+        row = Resource.objects.get()
+        self.assertEqual(row.name, "Second")
+        self.assertEqual(row.duration_hours, 12)
+
+    def test_upsert_never_downgrades_curated_status(self):
+        from .models import Resource
+
+        row = self._upsert()
+        row.content_source = "curated"
+        row.save(update_fields=["content_source"])
+        self._upsert(name="Reimported")
+        row.refresh_from_db()
+        self.assertEqual(row.content_source, "curated")
+
+    def test_upsert_records_health_when_checked(self):
+        from unittest.mock import patch
+        from datetime import datetime, timezone as tz
+        from .models import Resource
+
+        fake = {"health": "ok", "final_url": "https://example.com/course", "status_code": 200}
+        with patch("api.resource_catalog.check_url_health", return_value=fake):
+            row = self._upsert(check_health=True)
+        self.assertEqual(row.url_health, "ok")
+        self.assertIsNotNone(row.verified_at)
+
+    def test_stale_detection(self):
+        from datetime import datetime, timedelta, timezone as tz
+        from .resource_catalog import is_stale
+        from .models import Resource
+
+        row = self._upsert()
+        self.assertTrue(is_stale(row))  # never verified
+
+        row.verified_at = datetime.now(tz=tz.utc)
+        row.url_health = "ok"
+        self.assertFalse(is_stale(row))
+
+        row.verified_at = datetime.now(tz=tz.utc) - timedelta(days=120)
+        self.assertTrue(is_stale(row))
+
+        row.verified_at = datetime.now(tz=tz.utc)
+        row.url_health = "broken"
+        self.assertTrue(is_stale(row))
+
+    def test_search_catalog_orders_healthy_first_and_filters(self):
+        from datetime import datetime, timedelta, timezone as tz
+        from .resource_catalog import search_catalog
+        from .models import Resource
+
+        now = datetime.now(tz=tz.utc)
+        broken = self._upsert(url="https://a.com", name="Broken Python Course")
+        broken.url_health = "broken"
+        broken.verified_at = now
+        broken.save(update_fields=["url_health", "verified_at"])
+        stale = self._upsert(url="https://b.com", name="Stale Python Course")
+        stale.verified_at = now - timedelta(days=200)
+        stale.url_health = "ok"
+        stale.save(update_fields=["verified_at", "url_health"])
+        fresh = self._upsert(url="https://c.com", name="Fresh Python Course", level="intermediate")
+        fresh.url_health = "ok"
+        fresh.verified_at = now
+        fresh.save(update_fields=["url_health", "verified_at"])
+
+        rows = search_catalog(query="Python")
+        self.assertEqual([r.name for r in rows], ["Fresh Python Course", "Stale Python Course", "Broken Python Course"])
+
+        rows = search_catalog(query="Python", difficulty="intermediate")
+        self.assertEqual([r.name for r in rows], ["Fresh Python Course"])
+
+    def test_search_endpoint_prefers_catalog(self):
+        from unittest.mock import patch
+        from .resource_catalog import upsert_resource
+
+        fake = {"health": "ok", "final_url": "https://x.com", "status_code": 200}
+        with patch("api.resource_catalog.check_url_health", return_value=fake):
+            upsert_resource(url="https://x.com", name="Docker Deep Dive", type="course",
+                            level="intermediate", cost="paid", domain="cloud_devops",
+                            description="Containers from zero", check_health=True)
+
+        resp = self.client.get("/api/resources/search?query=Docker")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["source"], "catalog")
+        meta = body["results"][0]["metadata"]
+        self.assertEqual(meta["topic_name"], "Docker Deep Dive")
+        self.assertTrue(meta["verified"])
+        self.assertEqual(meta["cost"], "paid")
+        self.assertEqual(meta["source"], "catalog")
+
+    def test_search_endpoint_falls_back_to_ai_labeled(self):
+        from unittest.mock import patch
+        from langchain_core.runnables import RunnableLambda
+
+        payload = json.dumps([{
+            "topic_name": "Suggested Topic", "domain": "data_science",
+            "category": "course", "difficulty": "beginner",
+            "estimated_hours": 10, "description": "from the model",
+        }])
+        with patch("api.views._cache_get", return_value=None), \
+                patch("api.views._cache_set"), \
+                patch("api.views._get_llm", return_value=RunnableLambda(lambda x: payload)):
+            resp = self.client.get("/api/resources/search?query=nonexistent-xyz")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["source"], "ai")
+        self.assertEqual(body["results"][0]["metadata"]["source"], "ai")
+        self.assertFalse(body["results"][0]["metadata"]["verified"])
+
+    def test_annotate_verified_resources(self):
+        from .resource_catalog import annotate_verified_resources, catalog_index
+
+        rows = [self._upsert(url="https://docs.python.org", name="Python Docs")]
+        structured = {
+            "phases": [
+                {"topics": [
+                    {"resources": [
+                        {"name": "Python Docs", "type": "docs", "note": "official", "verified": True},
+                        {"name": "Random Blog", "type": "article", "note": "ok", "verified": True},
+                        {"name": "Other Course", "type": "course", "note": "fine", "verified": False},
+                    ]},
+                ]},
+            ],
+        }
+        out = annotate_verified_resources(structured, catalog_index(rows))
+        res = out["phases"][0]["topics"][0]["resources"]
+        self.assertTrue(res[0]["verified"])
+        self.assertEqual(res[0]["url"], "https://docs.python.org")
+        self.assertEqual(res[0]["source"], "catalog")
+        self.assertFalse(res[1]["verified"])  # claimed verified but not in catalog
+        self.assertEqual(res[1]["source"], "ai")
+        self.assertEqual(res[2]["source"], "ai")
+        self.assertFalse(res[2]["verified"])
+
+    def test_ingest_requires_admin_and_upserts(self):
+        from unittest.mock import patch
+        from .models import Resource
+
+        payload = json.dumps({"query": "python"})
+        resp = self.client.post("/api/resources/ingest", data=payload, content_type="application/json")
+        self.assertEqual(resp.status_code, 403)
+
+        self.client.force_login(self.user)
+        resp = self.client.post("/api/resources/ingest", data=payload, content_type="application/json")
+        self.assertEqual(resp.status_code, 403)
+
+        self.client.force_login(self.admin)
+        model_out = {"resources": [
+            {"name": "Real Course", "url": "https://real.example/course", "type": "course",
+             "level": "beginner", "cost": "free", "duration_hours": 20,
+             "domain": "programming", "description": "Learn it"},
+            {"name": "Bad", "url": "ftp://nope", "type": "course"},
+        ]}
+        fake = {"health": "ok", "final_url": "https://real.example/course", "status_code": 200}
+        with patch("api.resource_views.generate_resource_ingest", return_value=model_out), \
+                patch("api.resource_catalog.check_url_health", return_value=fake):
+            resp = self.client.post("/api/resources/ingest", data=payload, content_type="application/json")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["created"], 1)
+        self.assertEqual(body["skipped"], 1)
+        row = Resource.objects.get()
+        self.assertEqual(row.url_health, "ok")
+        self.assertEqual(row.content_source, "ai_generated")
+
+    def test_promote_and_verify_endpoints(self):
+        from unittest.mock import patch
+        from .resource_catalog import serialize_resource
+        from .models import Resource
+
+        row = self._upsert(url="https://p.example/x", name="Pick Me")
+        self.client.force_login(self.admin)
+
+        resp = self.client.post(
+            f"/api/resources/{row.id}/promote",
+            data=json.dumps({"content_source": "curated"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.content_source, "curated")
+
+        fake = {"health": "redirect", "final_url": "https://p.example/y", "status_code": 200}
+        with patch("api.resource_catalog.check_url_health", return_value=fake):
+            resp = self.client.post(f"/api/resources/{row.id}/verify")
+        self.assertEqual(resp.status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.url_health, "redirect")
+        self.assertEqual(row.final_url, "https://p.example/y")
+
+    def test_path_structured_prefers_catalog_resources(self):
+        from unittest.mock import patch
+        from .resource_catalog import upsert_resource
+
+        fake = {"health": "ok", "final_url": "https://docs.python.org", "status_code": 200}
+        with patch("api.resource_catalog.check_url_health", return_value=fake):
+            upsert_resource(url="https://docs.python.org", name="Python Docs", type="docs",
+                            level="beginner", cost="free", domain="programming",
+                            description="Official docs", check_health=True)
+
+        generated = {
+            "title": "Learn Python", "summary": "s", "total_weeks": 4,
+            "phases": [{
+                "title": "Basics", "description": "d", "estimated_weeks": 4,
+                "topics": [{
+                    "title": "Intro", "details": "x",
+                    "resources": [
+                        {"name": "Python Docs", "type": "docs", "note": "official", "verified": True},
+                        {"name": "Made Up Blog", "type": "article", "note": "hmm", "verified": False},
+                    ],
+                }],
+            }],
+        }
+        self.client.force_login(self.user)
+        with patch("api.views.generate_learning_path_structured", return_value=generated), \
+                patch("api.views.vector_memory") as memory, \
+                patch("api.views.catalog_for_generation", return_value=[
+                    type("R", (), {
+                        "id": 1, "url": "https://docs.python.org", "name": "Python Docs",
+                        "type": "docs", "level": "beginner", "cost": "free",
+                        "duration_hours": None, "domain": "programming",
+                        "description": "Official docs", "content_source": "curated",
+                        "url_health": "ok", "final_url": "", "verified_at": now_tz(),
+                        "community_rating": 4.5, "rating_count": 10,
+                    })(),
+                ]):
+            memory.save_path.return_value = "path_new"
+            resp = self.client.post(
+                "/api/path/structured",
+                data=json.dumps({"goal": "Learn Python"}), content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["id"], "path_new")
+        out = body["output"]
+        res = out["phases"][0]["topics"][0]["resources"]
+        self.assertTrue(res[0]["verified"])
+        self.assertEqual(res[0]["url"], "https://docs.python.org")
+        self.assertEqual(res[0]["rating"], 4.5)
+        self.assertFalse(res[1]["verified"])
+
+
+def now_tz():
+    from datetime import datetime, timezone
+    return datetime.now(tz=timezone.utc)
+
+
+class AdaptivePlacementTests(TestCase):
+    """One-question-at-a-time adaptive placement: engine unit tests and HTTP endpoints."""
+
+    def _pool(self):
+        return [
+            {"id": "e1", "question": "Easy Q", "options": ["a", "b", "c", "d"], "answer_index": 0, "difficulty": "easy"},
+            {"id": "m1", "question": "Med Q", "options": ["a", "b", "c", "d"], "answer_index": 1, "difficulty": "medium"},
+            {"id": "h1", "question": "Hard Q", "options": ["a", "b", "c", "d"], "answer_index": 2, "difficulty": "hard"},
+        ]
+
+    # --- engine unit tests ---
+
+    def test_correct_easy_advances_to_medium(self):
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        q = current_question(state)
+        self.assertEqual(q["difficulty"], "easy")
+        record_answer(state, q["id"], q["answer_index"])
+        q2 = current_question(state)
+        self.assertFalse(state["done"])
+        self.assertEqual(q2["difficulty"], "medium")
+
+    def test_miss_easy_stops_at_beginner(self):
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer, session_summary
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        q = current_question(state)
+        record_answer(state, q["id"], (q["answer_index"] + 1) % 4)  # wrong
+        self.assertTrue(state["done"])
+        self.assertEqual(state["level"], "beginner")
+        summary = session_summary(state)
+        self.assertEqual(summary["suggested_level"], "beginner")
+        self.assertEqual(len(summary["missed"]), 1)
+
+    def test_all_correct_reaches_advanced(self):
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        while not state["done"]:
+            q = current_question(state)
+            record_answer(state, q["id"], q["answer_index"])
+        self.assertEqual(state["level"], "advanced")
+
+    def test_miss_hard_gives_intermediate(self):
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        # answer easy and medium correctly
+        for _ in range(2):
+            q = current_question(state)
+            record_answer(state, q["id"], q["answer_index"])
+        # miss hard
+        q = current_question(state)
+        self.assertEqual(q["difficulty"], "hard")
+        record_answer(state, q["id"], (q["answer_index"] + 1) % 4)
+        self.assertTrue(state["done"])
+        self.assertEqual(state["level"], "intermediate")
+
+    def test_duplicate_answer_raises(self):
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        q = current_question(state)
+        record_answer(state, q["id"], q["answer_index"])
+        with self.assertRaises(ValueError):
+            record_answer(state, q["id"], 0)
+
+    def test_unknown_question_id_raises(self):
+        from api.placement_adaptive import new_state, prepare_pool, record_answer
+        pool = prepare_pool(self._pool())
+        state = new_state("Python", pool)
+        with self.assertRaises(KeyError):
+            record_answer(state, "ghost", 0)
+
+    def test_pool_without_hard_band_finishes_at_advanced(self):
+        """If the LLM omits hard questions, completing easy+medium still reaches advanced."""
+        from api.placement_adaptive import current_question, new_state, prepare_pool, record_answer
+        pool = prepare_pool([
+            {"id": "e1", "question": "Q", "options": ["a", "b"], "answer_index": 0, "difficulty": "easy"},
+            {"id": "m1", "question": "Q", "options": ["a", "b"], "answer_index": 0, "difficulty": "medium"},
+        ])
+        state = new_state("Python", pool)
+        while not state["done"]:
+            q = current_question(state)
+            record_answer(state, q["id"], q["answer_index"])
+        self.assertEqual(state["level"], "advanced")
+
+    # --- HTTP endpoint tests ---
+
+    def _post(self, url, payload):
+        return self.client.post(url, data=json.dumps(payload), content_type="application/json")
+
+    def test_adaptive_start_returns_first_question(self):
+        from unittest.mock import patch
+        from api.placement_adaptive import prepare_pool
+
+        with patch("api.views.generate_placement_quiz", return_value={"questions": self._pool()}):
+            resp = self._post("/api/placement/adaptive/start", {"goal": "Python"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("session_id", body)
+        self.assertFalse(body["done"])
+        self.assertIn("question", body)
+        self.assertNotIn("answer_index", body["question"])  # answer must not leak
+
+    def test_adaptive_answer_advances_and_finishes(self):
+        from unittest.mock import patch
+
+        with patch("api.views.generate_placement_quiz", return_value={"questions": self._pool()}):
+            start = self._post("/api/placement/adaptive/start", {"goal": "Python"}).json()
+
+        session_id = start["session_id"]
+        # Answer all questions correctly by reading the session state directly.
+        # We can't read answer_index from the response (it's stripped), so we
+        # drive through the engine by always picking index 0 and accepting whatever level results.
+        resp = None
+        for _ in range(5):  # at most 3 questions in our pool
+            q = (resp or start)["question"]
+            resp = self._post("/api/placement/adaptive/answer", {
+                "session_id": session_id,
+                "question_id": q["id"],
+                "answer_index": 0,
+            }).json()
+            if resp.get("done"):
+                break
+        self.assertTrue(resp["done"])
+        self.assertIn("summary", resp)
+        self.assertIn(resp["summary"]["suggested_level"], ("beginner", "intermediate", "advanced"))
+
+    def test_adaptive_answer_unknown_session_is_404(self):
+        resp = self._post("/api/placement/adaptive/answer", {
+            "session_id": "ghost", "question_id": "q1", "answer_index": 0,
+        })
+        self.assertEqual(resp.status_code, 404)
+
+    def test_adaptive_start_requires_goal(self):
+        resp = self._post("/api/placement/adaptive/start", {})
+        self.assertEqual(resp.status_code, 400)
+
+
+class AnalyticsEndpointTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="analyst", password="x")
+        self.path = structured_path(owner=str(self.user.id))
+        self.path_doc = {
+            "id": "path_test",
+            "content": self.path["content"],
+            "metadata": self.path["metadata"],
+        }
+
+    def _login(self):
+        self.client.force_login(self.user)
+
+    def _mock_path(self):
+        from unittest.mock import patch
+
+        patcher = patch("api.views.vector_memory")
+        self.addCleanup(patcher.stop)
+        memory = patcher.start()
+        memory.get_path.return_value = self.path_doc
+        return memory
+
+    def test_all_endpoints_require_login(self):
+        for url in (
+            "/api/analytics/dashboard/path_test",
+            "/api/analytics/daily/path_test",
+            "/api/analytics/velocity/path_test",
+            "/api/analytics/cohort/path_test",
+        ):
+            self.assertEqual(self.client.get(url).status_code, 401, url)
+
+    def test_missing_path_is_404(self):
+        from unittest.mock import patch
+
+        self._login()
+        with patch("api.views.vector_memory") as memory:
+            memory.get_path.return_value = None
+            self.assertEqual(
+                self.client.get("/api/analytics/dashboard/nope").status_code, 404
+            )
+
+    def test_dashboard_counts_topics_time_scores_and_weak_areas(self):
+        from .models import FocusSession, LearningAnalytics
+
+        self._login()
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:0", done=True)
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:1", done=True)
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:2", done=False)
+        TestResult.objects.create(user=self.user, path_id="path_test", phase_idx=0, score=4, total=5, percent=80)
+        TestResult.objects.create(user=self.user, path_id="path_test", phase_idx=1, score=2, total=5, percent=40)
+        FocusSession.objects.create(user=self.user, path_id="path_test", phase_idx=0, seconds=3600)
+
+        with self._mock_path():
+            data = self.client.get("/api/analytics/dashboard/path_test").json()
+
+        self.assertEqual(data["topics_completed"], 2)
+        self.assertEqual(data["topics_total"], 5)  # 3 + 2 topics; phases not double-counted
+        self.assertEqual(data["total_time_minutes"], 60)
+        self.assertEqual(data["average_test_score"], 60.0)
+        self.assertEqual(data["days_active"], 1)
+        self.assertIsNotNone(data["last_activity"])
+        self.assertEqual(data["predicted_completion_days"], 1)
+        # Phase 1 ("Advanced") averaged 40% < 70% threshold
+        self.assertEqual(len(data["weak_areas"]), 1)
+        self.assertEqual(data["weak_areas"][0]["phase"], "Advanced")
+        self.assertEqual(data["weak_areas"][0]["avg_score"], 40.0)
+        self.assertTrue(
+            LearningAnalytics.objects.filter(user=self.user, path_id="path_test").exists()
+        )
+
+    def test_daily_metrics_is_zero_filled_for_30_days(self):
+        from django.utils import timezone as tz
+
+        from .models import FocusSession
+
+        self._login()
+        FocusSession.objects.create(user=self.user, path_id="path_test", seconds=1800)
+
+        with self._mock_path():
+            data = self.client.get("/api/analytics/daily/path_test").json()
+
+        metrics = data["metrics"]
+        self.assertEqual(len(metrics), 30)
+        self.assertEqual(metrics[0]["time_minutes"], 0)
+        self.assertEqual(metrics[-1]["date"], tz.now().date().isoformat())
+        self.assertEqual(metrics[-1]["time_minutes"], 30)
+        self.assertEqual(metrics[-1]["topics_completed"], 0)
+        self.assertEqual(metrics[-1]["tests_taken"], 0)
+
+    def test_cohort_comparison_averages_and_percentile(self):
+        from .models import FocusSession
+
+        peer = User.objects.create_user(username="peer", password="x")
+        FocusSession.objects.create(user=self.user, path_id="path_test", seconds=1800)  # 30 min
+        FocusSession.objects.create(user=peer, path_id="path_test", seconds=3600)  # 60 min
+        PathProgress.objects.create(user=peer, path_id="path_test", item_key="t:0:0", done=True)
+
+        self._login()
+        with self._mock_path():
+            data = self.client.get("/api/analytics/cohort/path_test").json()
+
+        self.assertEqual(data["user_time_minutes"], 30)
+        self.assertEqual(data["cohort_avg_time_minutes"], 45.0)
+        self.assertEqual(data["user_topics_completed"], 0)
+        self.assertEqual(data["cohort_avg_topics"], 0.5)
+        self.assertEqual(data["cohort_size"], 2)
+        self.assertEqual(data["percentile"], 0)  # below the peer
+
+    def test_velocity_uses_last_week_progress(self):
+        self._login()
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:0", done=True)
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:1", done=True)
+        PathProgress.objects.create(user=self.user, path_id="path_test", item_key="t:0:2", done=False)
+
+        with self._mock_path():
+            data = self.client.get("/api/analytics/velocity/path_test").json()
+
+        self.assertEqual(data["topics_per_week"], 2)
+        self.assertEqual(data["estimated_completion_weeks"], 1)  # 1 remaining / 2 this week
+
+
+class SkillGraphViewTests(TestCase):
+    def setUp(self):
+        from .skill_graph import apply_skill_graph
+
+        self.user = User.objects.create_user(username="grapher", password="x")
+        self.path = structured_path(owner=str(self.user.id))
+        self.path_doc = {
+            "id": "path_test",
+            "content": self.path["content"],
+            "metadata": self.path["metadata"],
+        }
+        # Two skills, one prerequisite edge (Python -> Decorators),
+        # mapped to phase 0 and phase 1 topics.
+        graph = {
+            "skills": [
+                {"name": "Python", "slug": "python", "description": "core", "domain": "programming",
+                 "prerequisites": []},
+                {"name": "Decorators", "slug": "decorators", "description": "wrap", "domain": "programming",
+                 "prerequisites": ["python"]},
+            ],
+            "topic_map": [
+                {"topic_key": "t:0:0", "skill_slugs": ["python"]},
+                {"topic_key": "t:1:0", "skill_slugs": ["decorators"]},
+            ],
+        }
+        apply_skill_graph(
+            self.user, "path_test", graph,
+            topic_titles={"t:0:0": "Variables", "t:1:0": "Decorators"},
+        )
+
+    def _login(self):
+        self.client.force_login(self.user)
+
+    def _mock_path(self):
+        from unittest.mock import patch
+
+        patcher = patch("api.views.vector_memory")
+        self.addCleanup(patcher.stop)
+        memory = patcher.start()
+        memory.get_path.return_value = self.path_doc
+        return memory
+
+    def test_graph_requires_login(self):
+        self.assertEqual(self.client.get("/api/skills/graph/path_test").status_code, 401)
+        self.assertEqual(self.client.get("/api/skills/blockers/path_test").status_code, 401)
+        self.assertEqual(self.client.get("/api/skills/critical-path/path_test").status_code, 401)
+        self.assertEqual(self.client.get("/api/skills/mastery").status_code, 401)
+        self.assertEqual(self.client.get("/api/skills/1/prerequisites").status_code, 401)
+        self.assertEqual(self.client.get("/api/skills/1/unlocks").status_code, 401)
+
+    def test_graph_returns_deduped_nodes_and_real_edges(self):
+        self._login()
+        with self._mock_path():
+            data = self.client.get("/api/skills/graph/path_test").json()
+
+        self.assertEqual(len(data["nodes"]), 2)
+        ids = [n["id"] for n in data["nodes"]]
+        self.assertEqual(len(ids), len(set(ids)), "nodes must be unique")
+        by_name = {n["name"]: n for n in data["nodes"]}
+        self.assertEqual(by_name["Python"]["phase"], 0)
+        self.assertEqual(by_name["Decorators"]["phase"], 1)
+        self.assertEqual(by_name["Python"]["topics"], ["Variables"])
+        self.assertEqual(
+            data["edges"], [{"from": by_name["Python"]["id"], "to": by_name["Decorators"]["id"]}]
+        )
+
+    def test_prerequisites_and_unlocks_use_skilledge(self):
+        from .models import Skill
+
+        self._login()
+        python_id = Skill.objects.get(slug="python").id
+        decorators_id = Skill.objects.get(slug="decorators").id
+
+        prereqs = self.client.get(f"/api/skills/{decorators_id}/prerequisites").json()
+        self.assertEqual([p["id"] for p in prereqs["prerequisites"]], [python_id])
+
+        unlocks = self.client.get(f"/api/skills/{python_id}/unlocks").json()
+        self.assertEqual([u["id"] for u in unlocks["unlocks"]], [decorators_id])
+
+    def test_unknown_skill_is_404(self):
+        self._login()
+        self.assertEqual(self.client.get("/api/skills/999999/prerequisites").status_code, 404)
+        self.assertEqual(self.client.get("/api/skills/999999/unlocks").status_code, 404)
+
+    def test_critical_path_lists_skills_with_dependents(self):
+        from .models import Skill
+
+        self._login()
+        with self._mock_path():
+            data = self.client.get("/api/skills/critical-path/path_test").json()
+
+        self.assertEqual(data["total_critical"], 1)
+        entry = data["critical_skills"][0]
+        self.assertEqual(entry["skill"], "Python")
+        self.assertEqual(entry["unlocks_count"], 1)
+        self.assertEqual(entry["prerequisite_count"], 0)
+        self.assertEqual(entry["skill_id"], Skill.objects.get(slug="python").id)
+
+    def test_phase_blockers_flags_cross_phase_prerequisite(self):
+        self._login()
+        with self._mock_path():
+            data = self.client.get("/api/skills/blockers/path_test").json()
+
+        # Decorators (phase 1) requires Python (phase 0) — normal order, no warning.
+        self.assertEqual(data["warnings"], [])
+
+    def test_phase_blockers_flags_missing_prerequisite(self):
+        from .models import PathSkill, Skill
+
+        # A path that maps only Decorators (Python edge exists globally but is
+        # not part of this path) -> missing-prerequisite warning.
+        PathSkill.objects.filter(
+            user=self.user, path_id="path_test", skill__slug="python"
+        ).delete()
+
+        self._login()
+        with self._mock_path():
+            data = self.client.get("/api/skills/blockers/path_test").json()
+
+        self.assertEqual(len(data["warnings"]), 1)
+        warning = data["warnings"][0]
+        self.assertEqual(warning["type"], "missing_prerequisite")
+        self.assertIn("not covered in this path", warning["message"])
+
+    def test_mastery_status_returns_real_rows(self):
+        from .skill_graph import record_skill_evidence
+        from .models import Skill
+
+        record_skill_evidence(self.user, "path_test", phase_idx=0, score=85, strong=True)
+        self._login()
+        data = self.client.get("/api/skills/mastery").json()
+
+        self.assertEqual(len(data["mastery"]), 1)
+        entry = data["mastery"][0]
+        self.assertEqual(entry["skill"], "Python")
+        self.assertEqual(entry["state"], "validated")
+        self.assertEqual(entry["score"], 85)
+

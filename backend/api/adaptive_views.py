@@ -10,7 +10,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 from chains.path_generator import _parse_json, parse_markdown_phases
 from memory.vector_store import vector_memory
-from .models import FocusSession, PathProgress, TestResult
+from .models import FocusSession, MilestoneProject, PathProgress, TestResult
 from .progress_stats import record_activity
 from .study_views import _load_path, _require_user
 from .views import _copy_progress, _get_llm, _json_body, _version_meta
@@ -260,6 +260,113 @@ def path_difficulty(request, doc_id):
         "path_id": doc_id,
         "format": path["metadata"].get("format", "markdown"),
         "phases": phases,
+    })
+
+
+@require_GET
+def path_recommendation(request, doc_id):
+    """Return an explainable next study action from recorded learner evidence.
+
+    This deliberately uses small, auditable rules instead of claiming mastery from
+    sparse data.  A completed checklist item is an engagement signal; a phase-test
+    result is the only mastery signal used to trigger remediation.
+    """
+    denied = _require_user(request)
+    if denied:
+        return denied
+    path, err = _load_path(request, doc_id)
+    if err:
+        return err
+
+    from .views import _workspace_data
+    from .skill_graph import topic_skill_states
+
+    workspace = _workspace_data(path)
+    phases = (workspace or {}).get("phases") or []
+    done = set(PathProgress.objects.filter(
+        user=request.user, path_id=doc_id, done=True,
+    ).values_list("item_key", flat=True))
+    results = TestResult.objects.filter(user=request.user, path_id=doc_id).order_by("-created_at")
+    latest_scores = {}
+    for result in results:
+        latest_scores.setdefault(result.phase_idx, result.percent)
+
+    topic_skills = topic_skill_states(request.user, doc_id)
+
+    for phase_idx, phase in enumerate(phases):
+        topics = phase.get("topics") or []
+        unfinished = [topic for topic in topics if topic.get("key") not in done]
+        if unfinished:
+            pick = unfinished[0]
+            reason = "This is the first unfinished topic, preserving the roadmap's prerequisite order."
+            for candidate in unfinished:
+                state = topic_skills.get(candidate.get("key", ""))
+                if state and state.get("all_validated"):
+                    continue
+                pick = candidate
+                if candidate is not unfinished[0]:
+                    reason = (
+                        "Earlier topics here map to skills you already validated, "
+                        "so the path skips ahead to the first unmastered topic."
+                    )
+                break
+            else:
+                reason = (
+                    "Every remaining topic maps to skills you already validated — "
+                    "move through them quickly as review."
+                )
+            return JsonResponse({
+                "state": "learn",
+                "phase_idx": phase_idx,
+                "phase_title": phase.get("title", f"Phase {phase_idx + 1}"),
+                "topic_key": pick.get("key", ""),
+                "topic_title": pick.get("title", "Continue this phase"),
+                "reason": reason,
+            })
+
+        if topics and phase_idx not in latest_scores:
+            return JsonResponse({
+                "state": "validate",
+                "phase_idx": phase_idx,
+                "phase_title": phase.get("title", f"Phase {phase_idx + 1}"),
+                "topic_key": "",
+                "topic_title": "Check your understanding",
+                "reason": "You completed this phase. A short phase check provides evidence before the next dependency.",
+            })
+        if topics and latest_scores[phase_idx] < 70:
+            first_topic = topics[0]
+            score = latest_scores[phase_idx]
+            return JsonResponse({
+                "state": "remediate",
+                "phase_idx": phase_idx,
+                "phase_title": phase.get("title", f"Phase {phase_idx + 1}"),
+                "topic_key": first_topic.get("key", ""),
+                "topic_title": first_topic.get("title", "Review this phase"),
+                "score": score,
+                "reason": f"Your latest phase check was {score}%. Review the foundation, then retake the check.",
+            })
+
+        project = MilestoneProject.objects.filter(
+            user=request.user, path_id=doc_id, phase_idx=phase_idx,
+        ).first()
+        if project is not None and project.status != "reviewed":
+            return JsonResponse({
+                "state": "build",
+                "phase_idx": phase_idx,
+                "phase_title": phase.get("title", f"Phase {phase_idx + 1}"),
+                "topic_key": "",
+                "topic_title": project.title,
+                "project_status": project.status,
+                "reason": "You learned and proved this phase. Ship the capstone project to turn knowledge into evidence.",
+            })
+
+    return JsonResponse({
+        "state": "complete",
+        "phase_idx": max(0, len(phases) - 1),
+        "phase_title": "Roadmap complete",
+        "topic_key": "",
+        "topic_title": "Celebrate and choose your next goal",
+        "reason": "Every topic has been completed and each phase has learning evidence.",
     })
 
 

@@ -1,44 +1,56 @@
 import { useState } from "react";
-import { placementStart, placementSubmit } from "../api/client";
-import { X, Loader2 } from "lucide-react";
+import { placementAdaptiveStart, placementAdaptiveAnswer } from "../api/client";
+import { X, Loader2, ChevronRight } from "lucide-react";
+
+const DIFFICULTY_LABEL = { easy: "Easy", medium: "Medium", hard: "Hard" };
 
 export default function PlacementTest({ goal, onDone, onClose }) {
-  const [quiz, setQuiz] = useState(null);
-  const [answers, setAnswers] = useState({});
+  const [sessionId, setSessionId] = useState(null);
+  const [question, setQuestion] = useState(null);
+  const [selected, setSelected] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [answered, setAnswered] = useState(0);
 
   const start = async () => {
     setLoading(true);
     setError("");
     try {
-      const d = await placementStart(goal);
-      if (d.error) setError(d.error);
-      else {
-        setQuiz(d);
-        setAnswers({});
-      }
+      const d = await placementAdaptiveStart(goal);
+      if (d.error) { setError(d.error); return; }
+      setSessionId(d.session_id);
+      setQuestion(d.question);
+      setSelected(null);
+      setAnswered(0);
     } catch {
       setError("Failed to start the test.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const submit = async () => {
+    if (selected === null) return;
     setLoading(true);
     setError("");
     try {
-      const d = await placementSubmit(quiz.quiz_id, answers);
-      if (d.error) setError(d.error);
-      else setResult(d);
+      const d = await placementAdaptiveAnswer(sessionId, question.id, selected);
+      if (d.error) { setError(d.error); return; }
+      setAnswered((n) => n + 1);
+      if (d.done) {
+        setQuestion(null);
+        setResult(d.summary);
+      } else {
+        setQuestion(d.question);
+        setSelected(null);
+      }
     } catch {
-      setError("Failed to submit answers.");
+      setError("Failed to submit answer.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
-
-  const answered = quiz ? quiz.questions.every((q) => answers[q.id] !== undefined) : false;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -50,37 +62,50 @@ export default function PlacementTest({ goal, onDone, onClose }) {
 
         {error && <div className="error-box">{error}</div>}
 
-        {!quiz && !result && (
+        {!sessionId && !result && (
           <div className="modal-body">
-            <p>Answer 5 quick multiple-choice questions about <strong>{goal}</strong> and we'll suggest your level.</p>
+            <p>
+              Answer a short adaptive quiz about <strong>{goal}</strong> and we'll
+              suggest your starting level. The test stops as soon as we're confident.
+            </p>
             <button className="btn-primary" onClick={start} disabled={loading || !goal.trim()}>
               {loading ? <Loader2 className="spin" size={18} /> : "Start Test"}
             </button>
           </div>
         )}
 
-        {quiz && !result && (
+        {question && !result && (
           <div className="modal-body">
-            {quiz.questions.map((q, qi) => (
-              <div key={q.id} className="quiz-question">
-                <p><strong>Q{qi + 1}.</strong> {q.question}</p>
-                <div className="quiz-options">
-                  {q.options.map((opt, oi) => (
-                    <label key={oi} className={`radio-pill ${answers[q.id] === oi ? "active" : ""}`}>
-                      <input
-                        type="radio"
-                        name={q.id}
-                        checked={answers[q.id] === oi}
-                        onChange={() => setAnswers((prev) => ({ ...prev, [q.id]: oi }))}
-                      />
-                      {opt}
-                    </label>
-                  ))}
-                </div>
+            <div className="placement-progress">
+              <span className={`difficulty-badge`} data-level={question.difficulty}>
+                {DIFFICULTY_LABEL[question.difficulty] || question.difficulty}
+              </span>
+              <span className="placement-count">Question {answered + 1}</span>
+            </div>
+            <div className="quiz-question">
+              <p><strong>{question.question}</strong></p>
+              <div className="quiz-options">
+                {question.options.map((opt, oi) => (
+                  <label key={oi} className={`radio-pill ${selected === oi ? "active" : ""}`}>
+                    <input
+                      type="radio"
+                      name="adaptive-q"
+                      checked={selected === oi}
+                      onChange={() => setSelected(oi)}
+                    />
+                    {opt}
+                  </label>
+                ))}
               </div>
-            ))}
-            <button className="btn-primary" onClick={submit} disabled={loading || !answered}>
-              {loading ? <Loader2 className="spin" size={18} /> : "Submit Answers"}
+            </div>
+            <button
+              className="btn-primary"
+              onClick={submit}
+              disabled={loading || selected === null}
+            >
+              {loading
+                ? <Loader2 className="spin" size={18} />
+                : <><ChevronRight size={15} /> Next</>}
             </button>
           </div>
         )}
@@ -89,9 +114,29 @@ export default function PlacementTest({ goal, onDone, onClose }) {
           <div className="modal-body">
             <div className="placement-result">
               <h3>Score: {result.score}/{result.total} ({result.percent}%)</h3>
+              {result.skipped > 0 && (
+                <p className="placement-skipped">
+                  {result.skipped} question{result.skipped > 1 ? "s" : ""} skipped
+                  (test stopped early — confidence reached).
+                </p>
+              )}
               <p>
-                Suggested level: <strong className="level-badge">{result.suggested_level}</strong>
+                Suggested level:{" "}
+                <strong className="level-badge">{result.suggested_level}</strong>
               </p>
+              {result.missed?.length > 0 && (
+                <details className="placement-missed">
+                  <summary>Review {result.missed.length} missed question{result.missed.length > 1 ? "s" : ""}</summary>
+                  {result.missed.map((m) => (
+                    <div key={m.id} className="placement-missed-item">
+                      <p>{m.question}</p>
+                      <p className="placement-correct">
+                        Correct: option {m.correct_index + 1} · You chose: option {m.user_index + 1}
+                      </p>
+                    </div>
+                  ))}
+                </details>
+              )}
               <button className="btn-primary" onClick={() => onDone(result.suggested_level)}>
                 Use This Level
               </button>

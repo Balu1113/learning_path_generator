@@ -12,7 +12,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_GET
 
 from memory.vector_store import vector_memory
-from .models import Badge, Feedback, Flashcard, PathProgress, StudyActivity, TestResult
+from .models import Badge, Feedback, Flashcard, MilestoneProject, PathProgress, Resource, Skill, StudyActivity, TestResult
 
 User = get_user_model()
 
@@ -78,6 +78,32 @@ RESOURCES = {
         "display": ["user", "key", "earned_at"],
         "search": ["key"],
         "fk": ["user"],
+    },
+    "milestoneprojects": {
+        "model": MilestoneProject,
+        "label": "Milestone projects",
+        "fields": ["user", "path_id", "phase_idx", "phase_title", "title", "brief",
+                   "acceptance_criteria", "starter_template", "rubric",
+                   "submission_url", "submission_notes", "status", "ai_review", "ai_score"],
+        "display": ["user", "path_id", "phase_idx", "title", "status", "ai_score", "updated_at"],
+        "search": ["path_id", "title", "phase_title"],
+        "fk": ["user"],
+    },
+    "skills": {
+        "model": Skill,
+        "label": "Skills",
+        "fields": ["name", "slug", "description", "domain"],
+        "display": ["name", "slug", "domain", "created_at"],
+        "search": ["name", "slug", "domain"],
+    },
+    "resources": {
+        "model": Resource,
+        "label": "Resource catalog",
+        "fields": ["name", "url", "type", "level", "cost", "duration_hours", "domain",
+                   "description", "content_source", "url_health", "community_rating", "rating_count"],
+        "display": ["name", "url", "type", "level", "cost", "content_source", "url_health",
+                    "verified_at", "community_rating"],
+        "search": ["name", "url", "domain"],
     },
 }
 
